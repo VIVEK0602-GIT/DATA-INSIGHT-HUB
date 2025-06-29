@@ -1,0 +1,349 @@
+import google.generativeai as genai
+import pandas as pd
+import streamlit as st
+import json
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+import re
+import requests
+from typing import Dict, Any, List, Tuple
+
+# Define the API endpoint and model
+GEMINI_MODEL = "gemini-pro"  # Use the stable gemini-pro model
+GEMINI_API_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+def configure_gemini(api_key):
+    """Configure the Gemini API with the provided API key"""
+    try:
+        genai.configure(api_key=api_key)
+        return True
+    except Exception as e:
+        st.error(f"Error configuring Gemini API: {str(e)}")
+        return False
+
+def get_available_models():
+    """Get a list of available Gemini models that support generateContent"""
+    try:
+        models = []
+        for m in genai.list_models():
+            if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods:
+                models.append(m.name)
+        
+        if not models:
+            # Fallback to known model names if list_models doesn't return proper info
+            models = [
+                "gemini-1.5-pro-latest",
+                "gemini-1.0-pro",
+                "gemini-1.0-pro-latest",
+                "gemini-1.5-flash-latest"
+            ]
+        
+        return models
+    except Exception as e:
+        st.error(f"Error getting Gemini models: {e}")
+        # Return fallback model list
+        return [
+            "gemini-1.5-pro-latest",
+            "gemini-1.0-pro",
+            "gemini-1.0-pro-latest",
+            "gemini-1.5-flash-latest"
+        ]
+
+def create_simple_visualization(df, viz_type, x_col=None, y_col=None, title=None):
+    """
+    Create a simple visualization using Streamlit's native components.
+    
+    Parameters:
+    -----------
+    df : pandas DataFrame
+        The data to visualize
+    viz_type : str
+        Type of visualization (bar, line, scatter, etc.)
+    x_col : str
+        Column for x-axis
+    y_col : str
+        Column for y-axis
+    title : str
+        Title for the visualization
+        
+    Returns:
+    --------
+    bool
+        True if visualization was successful, False otherwise
+    """
+    try:
+        # Show title if provided
+        if title:
+            st.subheader(title)
+        
+        # Create different types of charts based on the visualization type
+        if viz_type.lower() in ['bar', 'bar chart', 'barchart']:
+            # For bar charts, we may need to aggregate the data
+            if df[x_col].nunique() > 20:
+                st.info(f"Many unique values in {x_col}. Showing aggregated data.")
+                
+            # Group by the x-axis and calculate stats for y-axis
+            if y_col:
+                chart_data = df.groupby(x_col)[y_col].agg(['mean', 'sum', 'count']).reset_index()
+                chart_data = chart_data.sort_values(('sum'), ascending=False).head(20)
+                # Display the bar chart
+                st.bar_chart(chart_data, x=x_col, y=('sum'))
+                # Show the data table
+                st.write("Data table:")
+                st.dataframe(chart_data)
+            else:
+                # If no y_col, show counts of x_col
+                counts = df[x_col].value_counts().reset_index()
+                counts.columns = ['value', 'count']
+                counts = counts.sort_values('count', ascending=False).head(20)
+                st.bar_chart(counts, x='value', y='count')
+                st.dataframe(counts)
+        
+        elif viz_type.lower() in ['line', 'line chart', 'linechart', 'trend']:
+            # For line charts, we need to ensure x-axis is properly ordered
+            if df[x_col].dtype == 'datetime64[ns]' or pd.api.types.is_datetime64_any_dtype(df[x_col]):
+                # For datetime x-axis
+                chart_data = df.sort_values(x_col)
+                st.line_chart(chart_data, x=x_col, y=y_col)
+            else:
+                # For non-datetime x-axis, we might need to aggregate
+                chart_data = df.groupby(x_col)[y_col].mean().reset_index()
+                chart_data = chart_data.sort_values(x_col)
+                st.line_chart(chart_data, x=x_col, y=y_col)
+            
+            # Show the data table
+            st.write("Data table:")
+            st.dataframe(chart_data)
+        
+        elif viz_type.lower() in ['scatter', 'scatter plot', 'scatterplot']:
+            # For scatter plots, just use the raw data
+            st.scatter_chart(df, x=x_col, y=y_col)
+            
+            # Show correlation
+            if x_col and y_col:
+                correlation = df[[x_col, y_col]].corr().iloc[0, 1]
+                st.write(f"Correlation between {x_col} and {y_col}: {correlation:.3f}")
+        
+        elif viz_type.lower() in ['histogram', 'hist']:
+            # For histograms, show distribution of a single column
+            if x_col:
+                # Count values and show as bar chart
+                if df[x_col].dtype in ['object', 'category']:
+                    # For categorical data
+                    counts = df[x_col].value_counts().reset_index()
+                    counts.columns = ['value', 'count']
+                    counts = counts.sort_values('count', ascending=False).head(20)
+                    st.bar_chart(counts, x='value', y='count')
+                else:
+                    # For numeric data, create bins
+                    hist_values = np.histogram(
+                        df[x_col].dropna(), 
+                        bins=min(20, df[x_col].nunique())
+                    )
+                    hist_df = pd.DataFrame({
+                        'bin': [f"{round(hist_values[1][i], 2)}-{round(hist_values[1][i+1], 2)}" 
+                                for i in range(len(hist_values[0]))],
+                        'count': hist_values[0]
+                    })
+                    st.bar_chart(hist_df, x='bin', y='count')
+                
+                # Show basic statistics
+                st.write(f"Statistics for {x_col}:")
+                st.dataframe(df[x_col].describe())
+        
+        else:
+            st.warning(f"Visualization type '{viz_type}' not supported. Showing data table instead.")
+            st.dataframe(df.head(20))
+            return False
+        
+        return True
+    
+    except Exception as e:
+        st.error(f"Error creating visualization: {str(e)}")
+        st.dataframe(df.head(10))
+        return False
+
+def analyze_data_with_gemini(df, query):
+    """
+    Analyze the data using Gemini AI based on the query.
+    
+    Parameters:
+    -----------
+    df : pandas DataFrame
+        The data to analyze
+    query : str
+        The user's query
+        
+    Returns:
+    --------
+    dict
+        Response from Gemini with content and possibly visualization
+    """
+    try:
+        # Generate a data summary for context
+        data_summary = get_data_summary(df)
+        
+        # Determine if the query is asking for a visualization
+        visualization_keywords = ['chart', 'plot', 'graph', 'visualize', 'visualization', 'show me', 'display', 'histogram', 'bar', 'line', 'scatter', 'trend']
+        is_visualization_query = any(keyword in query.lower() for keyword in visualization_keywords)
+        
+        # Create the prompt for Gemini
+        if is_visualization_query:
+            prompt = create_visualization_prompt(df, query, data_summary)
+        else:
+            prompt = create_analysis_prompt(df, query, data_summary)
+        
+        # Generate response from Gemini
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+        
+        # Process the response
+        response_text = response.text
+        
+        # If it's a visualization query, try to extract visualization instructions
+        if is_visualization_query:
+            viz_instructions = extract_visualization_instructions(response_text)
+            
+            if viz_instructions:
+                # Create visualization based on instructions
+                viz_type = viz_instructions.get('type')
+                x_column = viz_instructions.get('x_column')
+                y_column = viz_instructions.get('y_column')
+                title = viz_instructions.get('title')
+                
+                # Create a simpler visualization using Streamlit's native components
+                viz_success = create_simple_visualization(
+                    df, 
+                    viz_type=viz_type, 
+                    x_col=x_column, 
+                    y_col=y_column, 
+                    title=title
+                )
+                
+                if viz_success:
+                    return {
+                        "response_type": "visualization",
+                        "content": response_text,
+                        "visualization_details": viz_instructions
+                    }
+            
+            # If we couldn't extract visualization instructions or create the visualization,
+            # return the text response with a note
+            return {
+                "response_type": "text",
+                "content": response_text + "\n\nNote: I couldn't create the requested visualization automatically. "
+                          "Please try the Visualization tab for more chart options."
+            }
+        
+        # For non-visualization queries, just return the text
+        return {
+            "response_type": "text",
+            "content": response_text
+        }
+    
+    except Exception as e:
+        return {
+            "response_type": "error",
+            "content": f"Error analyzing data: {str(e)}"
+        }
+
+def get_data_summary(df):
+    """Generate a summary of the dataframe for context."""
+    summary = {
+        "shape": df.shape,
+        "columns": df.columns.tolist(),
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
+        "sample_data": df.head(3).to_dict()
+    }
+    
+    # Add basic statistics for numeric columns
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    if numeric_cols:
+        summary["numeric_stats"] = df[numeric_cols].describe().to_dict()
+    
+    return summary
+
+def create_analysis_prompt(df, query, data_summary):
+    """Create a prompt for data analysis."""
+    prompt = f"""You are an expert data analyst. Analyze the following dataset based on the user's query.
+Dataset Information:
+- Shape: {data_summary['shape']}
+- Columns: {', '.join(data_summary['columns'])}
+- Data types: {data_summary['dtypes']}
+
+User Query: {query}
+
+Provide a concise, clear, and informative answer. If you cannot answer the question with the data available, explain why.
+"""
+    return prompt
+
+def create_visualization_prompt(df, query, data_summary):
+    """Create a prompt for data visualization."""
+    prompt = f"""You are an expert data visualization specialist. The user wants to visualize the following dataset based on their query.
+Dataset Information:
+- Shape: {data_summary['shape']}
+- Columns: {', '.join(data_summary['columns'])}
+- Data types: {data_summary['dtypes']}
+
+User Query: {query}
+
+Please provide:
+1. An explanation of what visualization would be appropriate for this query
+2. The exact column names to use for the x-axis and y-axis
+3. The type of chart to create (bar, line, scatter, pie, etc.)
+4. A title for the visualization
+
+Format your response in a way that I can easily extract this information. Use the following format:
+
+EXPLANATION: [your explanation]
+VISUALIZATION_TYPE: [bar/line/scatter/histogram/etc.]
+X_COLUMN: [column name for x-axis]
+Y_COLUMN: [column name for y-axis or 'None' if not applicable]
+TITLE: [suggested title for the visualization]
+
+After that, you can provide additional context or information about the visualization.
+"""
+    return prompt
+
+def extract_visualization_instructions(response_text):
+    """Extract visualization instructions from the Gemini response."""
+    try:
+        # Look for the specially formatted instructions
+        viz_type_match = re.search(r'VISUALIZATION_TYPE:\s*(\w+(?:\s+\w+)*)', response_text)
+        x_col_match = re.search(r'X_COLUMN:\s*(\w+(?:_\w+)*)', response_text)
+        y_col_match = re.search(r'Y_COLUMN:\s*(\w+(?:_\w+)*|None)', response_text)
+        title_match = re.search(r'TITLE:\s*(.+)(?:\n|$)', response_text)
+        
+        if not viz_type_match or not x_col_match:
+            # If we can't find the basic instructions, try a fallback approach
+            # Look for common phrases that might indicate visualization details
+            viz_types = ['bar', 'line', 'scatter', 'pie', 'histogram']
+            viz_type = next((vt for vt in viz_types if vt in response_text.lower()), 'bar')
+            
+            # Look for column references
+            column_pattern = r'columns?\s+["\']?(\w+(?:_\w+)*)["\']?'
+            column_matches = re.findall(column_pattern, response_text)
+            
+            x_column = column_matches[0] if column_matches else None
+            y_column = column_matches[1] if len(column_matches) > 1 else None
+            title = "Data Visualization"
+        else:
+            # Extract the values from the regex matches
+            viz_type = viz_type_match.group(1).strip().lower()
+            x_column = x_col_match.group(1).strip()
+            y_column = y_col_match.group(1).strip() if y_col_match else None
+            if y_column and y_column.lower() == 'none':
+                y_column = None
+            title = title_match.group(1).strip() if title_match else "Data Visualization"
+        
+        return {
+            "type": viz_type,
+            "x_column": x_column,
+            "y_column": y_column,
+            "title": title
+        }
+    
+    except Exception as e:
+        st.error(f"Error extracting visualization instructions: {str(e)}")
+        return None 

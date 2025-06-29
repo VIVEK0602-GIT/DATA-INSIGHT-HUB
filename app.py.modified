@@ -1,0 +1,1422 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import os
+import io
+import json
+import base64
+
+# Import our modules
+import database as db
+import data_utils as du
+import gemini_chat as gemini
+
+# Global visualization configuration for consistent appearance
+def apply_standard_layout(fig, title, x_title=None, y_title=None):
+    """Function kept for compatibility, but simplified since we're using Streamlit charts"""
+    # Just show the title since we're using Streamlit's native charts
+    st.subheader(title)
+    return fig
+
+# Replace the safe_create_visualization function with a simpler version using Streamlit charts
+def safe_create_visualization(df, chart_type, x_axis, y_axis, color=None, title=None, height=None, width=None, **kwargs):
+    """Create visualization with simple Streamlit charts for better stability"""
+    try:
+        # Prepare chart title
+        if title:
+            st.subheader(title)
+        
+        # Create simple visualizations using Streamlit native components
+        if chart_type == "Bar Chart":
+            # Group by x_axis and aggregate y_axis
+            if x_axis and y_axis:
+                chart_data = df.groupby(x_axis)[y_axis].sum().reset_index()
+                st.bar_chart(data=chart_data, x=x_axis, y=y_axis)
+                return True
+                
+        elif chart_type == "Line Chart":
+            if x_axis and y_axis:
+                # For line charts, we should sort by x_axis
+                chart_data = df.sort_values(by=x_axis)
+                st.line_chart(data=chart_data, x=x_axis, y=y_axis)
+                return True
+                
+        elif chart_type == "Scatter Plot":
+            if x_axis and y_axis:
+                st.scatter_chart(data=df, x=x_axis, y=y_axis)
+                return True
+                
+        elif chart_type == "Histogram":
+            if x_axis:
+                # For histograms, we use a bar chart of value_counts
+                value_counts = df[x_axis].value_counts().reset_index()
+                value_counts.columns = ['value', 'count']
+                st.bar_chart(data=value_counts, x='value', y='count')
+                return True
+                
+        elif chart_type == "Box Plot" or chart_type == "Pie Chart":
+            # For now, display statistical summary instead of box/pie charts
+            if y_axis:
+                st.write(f"Statistical summary for {y_axis}:")
+                st.dataframe(df[y_axis].describe())
+                return True
+        
+        # For cases where we couldn't create a chart
+        return False
+    except Exception as e:
+        st.error(f"Error creating visualization: {str(e)}")
+        return False
+
+# Configure page
+st.set_page_config(
+    page_title="DataInsightHub",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Gemini API configuration
+GEMINI_API_KEY = "AIzaSyDVOxhkHvtkb-E1dcrInXGlHoW5Yzw2nWE"  # Replace with your actual API key
+
+try:
+    success = gemini.configure_gemini(GEMINI_API_KEY)
+    gemini_configured = success
+    if success:
+        st.session_state.gemini_api_key = GEMINI_API_KEY
+except Exception as e:
+    gemini_configured = False
+    gemini_error = str(e)
+
+# Initialize session state variables
+if 'df' not in st.session_state:
+    st.session_state.df = None
+if 'file_info' not in st.session_state:
+    st.session_state.file_info = None
+if 'dataset_id' not in st.session_state:
+    st.session_state.dataset_id = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'current_visualization' not in st.session_state:
+    st.session_state.current_visualization = None
+
+# Main heading
+st.title("DataInsightHub")
+st.write("A data analysis platform with AI-powered chat capabilities")
+
+# Sidebar for data management
+with st.sidebar:
+    st.header("Data Management")
+    
+    st.markdown("---")
+    
+    # Data loading options
+    st.subheader("📂 Load Data")
+    
+    # Option 1: Upload file
+    uploaded_file = st.file_uploader("Upload your data file", type=["csv", "xlsx"])
+    
+    # Option 2: Load from database
+    st.markdown("### 💾 Saved Datasets")
+    try:
+        datasets = db.get_datasets()
+        if not datasets.empty:
+            dataset_options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in datasets.iterrows()}
+            selected_dataset = st.selectbox("Select a saved dataset", 
+                                           options=list(dataset_options.keys()),
+                                           index=None)
+            if selected_dataset:
+                selected_id = dataset_options[selected_dataset]
+                dataset_info = db.get_dataset(selected_id)
+                if dataset_info is not None:
+                    # Get data from file path or recreate if needed
+                    if os.path.exists(dataset_info['file_path']):
+                        if dataset_info['file_path'].endswith('.csv'):
+                            st.session_state.df = pd.read_csv(dataset_info['file_path'])
+                        elif dataset_info['file_path'].endswith('.xlsx'):
+                            st.session_state.df = pd.read_excel(dataset_info['file_path'])
+                    else:
+                        st.warning("Original file not found. Using sample data.")
+                        st.session_state.df = du.create_sample_data()
+                    
+                    st.session_state.dataset_id = selected_id
+                    st.session_state.file_info = {
+                        'filename': dataset_info['name'],
+                        'size': dataset_info['file_size'],
+                        'shape': (dataset_info['row_count'], len(json.loads(dataset_info['column_info'])['columns']))
+                    }
+                    st.success(f"Loaded dataset: {dataset_info['name']}")
+                    st.rerun()
+        else:
+            st.info("No saved datasets found.")
+    except Exception as e:
+        st.error(f"Error loading datasets: {str(e)}")
+    
+    # Option 3: Use sample data
+    st.markdown("### 🧪 Sample Data")
+    if st.button("Load Sample Data"):
+        st.session_state.df = du.create_sample_data()
+        st.session_state.file_info = {
+            'filename': 'sample_data.csv',
+            'size': len(st.session_state.df) * len(st.session_state.df.columns) * 8,
+            'type': 'text/csv',
+            'shape': st.session_state.df.shape
+        }
+        st.success("Sample data loaded successfully!")
+        st.rerun()
+    
+    # Process uploaded file
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                st.session_state.df, st.session_state.file_info = du.load_csv(uploaded_file)
+            elif uploaded_file.name.endswith('.xlsx'):
+                st.session_state.df, st.session_state.file_info = du.load_excel(uploaded_file)
+            else:
+                st.error("Unsupported file type. Please upload a CSV or Excel file.")
+                
+            # Show file details
+            if st.session_state.df is not None:
+                st.success("File uploaded successfully!")
+                
+                # Save to database option
+                st.markdown("### 💾 Save to Database")
+                save_name = st.text_input("Dataset Name", value=uploaded_file.name)
+                save_desc = st.text_area("Description", value="")
+                
+                if st.button("Save Dataset"):
+                    try:
+                        # Save file locally
+                        os.makedirs("data/uploads", exist_ok=True)
+                        file_path = f"data/uploads/{uploaded_file.name}"
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        
+                        # Save to database
+                        dataset_id = db.save_dataset(
+                            name=save_name,
+                            description=save_desc,
+                            df=st.session_state.df,
+                            file_path=file_path,
+                            file_size=uploaded_file.size
+                        )
+                        st.session_state.dataset_id = dataset_id
+                        st.success(f"Dataset saved with ID: {dataset_id}")
+                    except Exception as e:
+                        st.error(f"Error saving dataset: {str(e)}")
+                
+        except Exception as e:
+            st.error(f"Error processing file: {str(e)}")
+    
+    # If data is loaded, show summary
+    if st.session_state.df is not None:
+        st.markdown("---")
+        st.subheader("📋 Data Summary")
+        st.markdown(f"""
+        **File**: {st.session_state.file_info['filename']}  
+        **Rows**: {st.session_state.file_info['shape'][0]}  
+        **Columns**: {st.session_state.file_info['shape'][1]}
+        """)
+        
+        # Clear data button
+        if st.button("Clear Data"):
+            st.session_state.df = None
+            st.session_state.file_info = None
+            st.session_state.dataset_id = None
+            st.session_state.current_visualization = None
+            st.rerun()
+
+# Main content area - only show if data is loaded
+if st.session_state.df is not None:
+    # Create tabs for different functionalities
+    tabs = st.tabs(["Data Preview", "Analysis", "Visualization", "Performance Metrics", "Chat with Data", "Saved Items"])
+    
+    # Tab 1: Data Preview
+    with tabs[0]:
+        st.header("Data Preview")
+        
+        # Display the first few rows of the data
+        st.dataframe(st.session_state.df.head(10), use_container_width=True)
+        
+        # Display data types and summary
+        st.subheader("Column Information")
+        
+        # Create two columns
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Data types
+            dtypes_df = pd.DataFrame({
+                'Column': st.session_state.df.columns.tolist(),
+                'Data Type': [str(dtype) for dtype in st.session_state.df.dtypes.values]
+            })
+            # Convert all columns to string type to avoid Arrow conversion issues
+            dtypes_df = dtypes_df.astype(str)
+            st.dataframe(dtypes_df, use_container_width=True)
+        
+        with col2:
+            # Missing values
+            missing_df = pd.DataFrame({
+                'Column': st.session_state.df.columns.tolist(),
+                'Missing Values': st.session_state.df.isna().sum().values.tolist(),
+                'Missing %': (st.session_state.df.isna().sum().values / len(st.session_state.df) * 100).round(2).tolist()
+            })
+            # Convert all columns to string type to avoid Arrow conversion issues
+            missing_df = missing_df.astype(str)
+            st.dataframe(missing_df, use_container_width=True)
+        
+        # Download options
+        st.subheader("Download Data")
+        download_format = st.selectbox("Select format", ["CSV", "Excel", "JSON"])
+        
+        if download_format == "CSV":
+            csv = st.session_state.df.to_csv(index=False)
+            st.download_button(
+                label="Download CSV",
+                data=csv,
+                file_name=f"{st.session_state.file_info['filename']}.csv",
+                mime="text/csv"
+            )
+        elif download_format == "Excel":
+            buffer = io.BytesIO()
+            st.session_state.df.to_excel(buffer, index=False)
+            buffer.seek(0)
+            st.download_button(
+                label="Download Excel",
+                data=buffer,
+                file_name=f"{st.session_state.file_info['filename']}.xlsx",
+                mime="application/vnd.ms-excel"
+            )
+        elif download_format == "JSON":
+            json_str = st.session_state.df.to_json(orient="records")
+            st.download_button(
+                label="Download JSON",
+                data=json_str,
+                file_name=f"{st.session_state.file_info['filename']}.json",
+                mime="application/json"
+            )
+    
+    # Tab 2: Analysis
+    with tabs[1]:
+        st.header("Data Analysis")
+        
+        # Create subtabs for different analyses
+        analysis_tabs = st.tabs(["Descriptive Statistics", "Correlation Analysis", "Advanced Analysis"])
+        
+        # Subtab 1: Descriptive Statistics
+        with analysis_tabs[0]:
+            st.subheader("Descriptive Statistics")
+            
+            # Get numeric columns only
+            numeric_cols = st.session_state.df.select_dtypes(include=['number']).columns.tolist()
+            
+            if numeric_cols:
+                # Select columns to analyze
+                selected_cols = st.multiselect(
+                    "Select columns for analysis",
+                    numeric_cols,
+                    default=numeric_cols[:min(5, len(numeric_cols))]  # Default to first 5 numeric columns
+                )
+                
+                if selected_cols:
+                    # Calculate statistics
+                    stats = du.get_descriptive_stats(st.session_state.df[selected_cols])
+                    
+                    # Display statistics
+                    st.dataframe(stats, use_container_width=True)
+                    
+                    # Save statistics
+                    if st.session_state.dataset_id and st.button("Save Statistics to Database"):
+                        try:
+                            result_id = db.save_analysis_result(
+                                dataset_id=st.session_state.dataset_id,
+                                analysis_type="descriptive_statistics",
+                                result_data=stats.to_dict()
+                            )
+                            st.success(f"Statistics saved with ID: {result_id}")
+                        except Exception as e:
+                            st.error(f"Error saving statistics: {str(e)}")
+                    
+                    # Download option
+                    csv = stats.to_csv()
+                    st.download_button(
+                        label="Download Statistics as CSV",
+                        data=csv,
+                        file_name="descriptive_statistics.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("Please select at least one column for analysis")
+            else:
+                st.warning("No numeric columns found in the dataset")
+            
+            # For categorical data
+            cat_cols = st.session_state.df.select_dtypes(include=['object', 'category']).columns.tolist()
+            if cat_cols:
+                st.subheader("Categorical Data Analysis")
+                
+                selected_cat_cols = st.multiselect(
+                    "Select categorical columns for analysis",
+                    cat_cols,
+                    default=cat_cols[:min(2, len(cat_cols))]
+                )
+                
+                if selected_cat_cols:
+                    # Get categorical statistics
+                    cat_stats = du.get_categorical_stats(st.session_state.df[selected_cat_cols])
+                    
+                    for idx, col in enumerate(selected_cat_cols):
+                        st.write(f"### Column: {col}")
+                        
+                        # Get value counts
+                        value_counts = st.session_state.df[col].value_counts().reset_index()
+                        value_counts.columns = ['Value', 'Count']  # Explicitly name columns
+                        
+                        # Display the top 10 values
+                        st.dataframe(value_counts.head(10).astype(str), use_container_width=True)
+                        
+                        # Visualization of distribution
+                        try:
+                            # Convert all values to strings to avoid any typecasting issues
+                            value_counts['Value'] = value_counts['Value'].astype(str)
+                            
+                            # Use simplified visualization approach
+                            st.write(f"Distribution of {col}")
+                            st.bar_chart(value_counts.head(10), x='Value', y='Count')
+                        except Exception as e:
+                            st.error(f"Error creating visualization: {str(e)}")
+                            st.code(str(e))
+                            
+                            # Try simpler method
+                            try:
+                                st.warning("Showing simplified data table instead")
+                                st.dataframe(value_counts.head(10))
+                            except Exception as fallback_error:
+                                st.error(f"Data display also failed: {str(fallback_error)}")
+                                st.code(str(fallback_error))
+                        except Exception as e:
+                            st.error(f"Error creating visualization: {str(e)}")
+                            
+                            # Try simpler method
+                            try:
+                                st.warning("Showing simplified data table instead")
+                                st.dataframe(value_counts.head(10))
+                            except Exception as fallback_error:
+                                st.error(f"Data display also failed: {str(fallback_error)}")
+                                st.code(str(fallback_error))
+        
+        # Subtab 2: Correlation Analysis
+        with analysis_tabs[1]:
+            st.subheader("Correlation Analysis")
+            
+            # Only show for numeric data
+            numeric_cols = st.session_state.df.select_dtypes(include=['number']).columns.tolist()
+            
+            if len(numeric_cols) >= 2:
+                # Select columns for correlation
+                selected_cols = st.multiselect(
+                    "Select columns for correlation analysis",
+                    numeric_cols,
+                    default=numeric_cols[:min(5, len(numeric_cols))]
+                )
+                
+                if len(selected_cols) >= 2:
+                    # Select correlation method
+                    method = st.selectbox(
+                        "Correlation Method",
+                        ["pearson", "spearman", "kendall"],
+                        index=0
+                    )
+                    
+                    # Calculate correlation
+                    corr_matrix = st.session_state.df[selected_cols].corr(method=method)
+                    
+                    # Show correlation matrix
+                    st.write("### Correlation Matrix")
+                    try:
+                        # Apply simpler approach for better stability
+                        # Display as a styled dataframe with color coding
+                        st.dataframe(corr_matrix.style.background_gradient(cmap='coolwarm'), use_container_width=True)
+                        
+                        # Show strongest correlations
+                        st.write("### Strongest Correlations")
+                        # Get upper triangle of correlation matrix
+                        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+                        # Find top correlations
+                        strongest = upper.unstack().sort_values(ascending=False).dropna().head(5)
+                        # Convert to dataframe
+                        strong_df = pd.DataFrame(strongest).reset_index()
+                        strong_df.columns = ['Feature 1', 'Feature 2', 'Correlation']
+                        st.dataframe(strong_df, use_container_width=True)
+                        
+                    except Exception as e:
+                        st.error(f"Error creating correlation visualization: {str(e)}")
+                        st.code(str(e))
+                        # Fallback to simple display
+                        st.write("Correlation matrix (fallback view):")
+                        st.dataframe(corr_matrix.round(2), use_container_width=True)
+                    
+                    # Save to database
+                    if st.session_state.dataset_id and st.button("Save Correlation to Database"):
+                        try:
+                            # Convert the correlation matrix to a valid JSON format
+                            corr_data = corr_matrix.reset_index().to_dict(orient='records')
+                            result_id = db.save_analysis_result(
+                                dataset_id=st.session_state.dataset_id,
+                                analysis_type="correlation_matrix",
+                                result_data=json.dumps(corr_data)
+                            )
+                            st.success(f"Correlation matrix saved with ID: {result_id}")
+                        except Exception as e:
+                            st.error(f"Error saving correlation matrix: {str(e)}")
+                            st.code(str(e))
+                    
+                    # Download option
+                    csv = corr_matrix.to_csv()
+                    st.download_button(
+                        label="Download Correlation Matrix as CSV",
+                        data=csv,
+                        file_name="correlation_matrix.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("Please select at least two columns for correlation analysis")
+            else:
+                st.warning("Need at least two numeric columns for correlation analysis")
+        
+        # Subtab 3: Advanced Analysis
+        with analysis_tabs[2]:
+            st.subheader("Advanced Analysis")
+            
+            # PCA analysis
+            if st.checkbox("Principal Component Analysis (PCA)"):
+                numeric_cols = st.session_state.df.select_dtypes(include=['number']).columns.tolist()
+                
+                if len(numeric_cols) >= 2:
+                    # Select columns for PCA
+                    selected_cols = st.multiselect(
+                        "Select columns for PCA",
+                        numeric_cols,
+                        default=numeric_cols[:min(5, len(numeric_cols))],
+                        key="pca_columns"
+                    )
+                    
+                    if len(selected_cols) >= 2:
+                        # Number of components
+                        n_components = st.slider(
+                            "Number of Components",
+                            min_value=2,
+                            max_value=min(len(selected_cols), 10),
+                            value=2
+                        )
+                        
+                        # Run PCA
+                        if st.button("Run PCA"):
+                            # Perform PCA analysis
+                            pca_df, explained_variance, loadings = du.run_pca_analysis(
+                                st.session_state.df[selected_cols],
+                                n_components=n_components
+                            )
+                            
+                            if pca_df is not None:
+                                # Show explained variance
+                                st.write("### Explained Variance")
+                                explained_var_df = pd.DataFrame({
+                                    'Component': [f'PC{i+1}' for i in range(n_components)],
+                                    'Explained Variance (%)': [v * 100 for v in explained_variance]
+                                })
+                                st.dataframe(explained_var_df, use_container_width=True)
+                                
+                                # Show loadings
+                                st.write("### Component Loadings")
+                                st.dataframe(loadings, use_container_width=True)
+                                
+                                # Visualization of first two components
+                                st.write("### PCA Scatter Plot (First Two Components)")
+                                fig = px.scatter(
+                                    pca_df,
+                                    x='PC1',
+                                    y='PC2',
+                                    title="PCA Projection"
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Please select at least two columns for PCA")
+                else:
+                    st.warning("Need at least two numeric columns for PCA")
+            
+            # K-means clustering
+            if st.checkbox("K-means Clustering"):
+                numeric_cols = st.session_state.df.select_dtypes(include=['number']).columns.tolist()
+                
+                if len(numeric_cols) >= 2:
+                    # Select columns for clustering
+                    selected_cols = st.multiselect(
+                        "Select columns for clustering",
+                        numeric_cols,
+                        default=numeric_cols[:min(3, len(numeric_cols))],
+                        key="kmeans_columns"
+                    )
+                    
+                    if len(selected_cols) >= 2:
+                        # Number of clusters
+                        n_clusters = st.slider(
+                            "Number of Clusters",
+                            min_value=2,
+                            max_value=10,
+                            value=3
+                        )
+                        
+                        # Run clustering
+                        if st.button("Run K-means Clustering"):
+                            # Perform clustering
+                            cluster_df, centers = du.run_kmeans_clustering(
+                                st.session_state.df[selected_cols],
+                                n_clusters=n_clusters
+                            )
+                            
+                            if cluster_df is not None:
+                                # Show cluster centers
+                                st.write("### Cluster Centers")
+                                st.dataframe(centers, use_container_width=True)
+                                
+                                # Show cluster distribution
+                                st.write("### Cluster Distribution")
+                                cluster_counts = cluster_df['cluster'].value_counts().reset_index()
+                                cluster_counts.columns = ['Cluster', 'Count']
+                                
+                                fig = px.bar(
+                                    cluster_counts,
+                                    x='Cluster',
+                                    y='Count',
+                                    title="Distribution of Clusters"
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Visualization of clusters using first two features
+                                if len(selected_cols) >= 2:
+                                    st.write("### Cluster Visualization")
+                                    fig = px.scatter(
+                                        cluster_df,
+                                        x=selected_cols[0],
+                                        y=selected_cols[1],
+                                        color='cluster',
+                                        title=f"Clusters by {selected_cols[0]} and {selected_cols[1]}"
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Please select at least two columns for clustering")
+                else:
+                    st.warning("Need at least two numeric columns for clustering")
+    
+    # Tab 3: Visualization
+    with tabs[2]:
+        st.header("Data Visualization")
+        
+        # Create two columns: one for controls, one for the visualization
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            # Visualization controls
+            st.subheader("Chart Options")
+            
+            # Chart type selection
+            chart_type = st.selectbox(
+                "Chart Type",
+                ["Bar Chart", "Line Chart", "Scatter Plot", "Histogram"],
+                key="chart_type_select"
+            )
+            
+            # Get column lists by type
+            numeric_cols = st.session_state.df.select_dtypes(include=['number']).columns.tolist()
+            categorical_cols = st.session_state.df.select_dtypes(include=['object', 'category']).columns.tolist()
+            temporal_cols = st.session_state.df.select_dtypes(include=['datetime']).columns.tolist()
+            all_cols = st.session_state.df.columns.tolist()
+            
+            # Dynamic controls based on chart type
+            x_axis = None
+            y_axis = None
+            
+            if chart_type == "Bar Chart":
+                x_axis = st.selectbox("X-axis (Categories)", all_cols, key="bar_x_axis")
+                y_axis = st.selectbox("Y-axis (Values)", numeric_cols if numeric_cols else all_cols, key="bar_y_axis")
+            
+            elif chart_type == "Line Chart":
+                if temporal_cols:
+                    x_axis = st.selectbox("X-axis (Time)", temporal_cols + all_cols, key="line_x_axis")
+                else:
+                    x_axis = st.selectbox("X-axis", all_cols, key="line_x_axis")
+                y_axis = st.selectbox("Y-axis (Values)", numeric_cols if numeric_cols else all_cols, key="line_y_axis")
+            
+            elif chart_type == "Scatter Plot":
+                x_axis = st.selectbox("X-axis", numeric_cols if numeric_cols else all_cols, key="scatter_x_axis")
+                y_axis = st.selectbox("Y-axis", numeric_cols if numeric_cols else all_cols, key="scatter_y_axis")
+            
+            elif chart_type == "Histogram":
+                x_axis = st.selectbox("Value", numeric_cols if numeric_cols else all_cols, key="hist_x_axis")
+                bins = st.slider("Number of bins", 5, 50, 10, key="hist_bins")
+            
+            # Chart title
+            title = st.text_input("Chart Title", f"{chart_type} of {x_axis if x_axis else 'data'}", key="chart_title")
+            
+            # Create visualization button
+            create_viz = st.button("Create Visualization")
+        
+        with col2:
+            # Display area for visualization
+            if create_viz:
+                st.write("Creating visualization...")
+                
+                try:
+                    # Validate selections
+                    error_messages = []
+                    
+                    if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot"] and (x_axis is None or y_axis is None):
+                        error_messages.append("Please select both X-axis and Y-axis columns")
+                    elif chart_type == "Histogram" and x_axis is None:
+                        error_messages.append("Please select a Value column")
+                    
+                    if error_messages:
+                        for msg in error_messages:
+                            st.warning(msg)
+                        st.info("Please check your selections and try again.")
+                    else:
+                        # Use the simplified visualization function
+                        if chart_type == "Histogram":
+                            # Apply bins for histogram
+                            result = safe_create_visualization(
+                                st.session_state.df,
+                                chart_type,
+                                x_axis=x_axis,
+                                y_axis=None,
+                                title=title
+                            )
+                        else:
+                            result = safe_create_visualization(
+                                st.session_state.df,
+                                chart_type,
+                                x_axis=x_axis,
+                                y_axis=y_axis,
+                                title=title
+                            )
+                        
+                        # Add additional information below the chart
+                        if result:
+                            # Show basic statistics for the selected columns
+                            st.write("### Data Summary")
+                            
+                            if chart_type != "Histogram" and y_axis:
+                                st.write(f"**Statistics for {y_axis}:**")
+                                st.dataframe(st.session_state.df[y_axis].describe())
+                            
+                            if x_axis:
+                                st.write(f"**Distribution of {x_axis}:**")
+                                value_counts = st.session_state.df[x_axis].value_counts().head(10).reset_index()
+                                value_counts.columns = ['Value', 'Count']
+                                st.dataframe(value_counts)
+                        else:
+                            st.error("Could not create visualization. Please try different selections.")
+                
+                except Exception as e:
+                    st.error(f"Error creating visualization: {str(e)}")
+                    st.code(str(e))
+            else:
+                st.info("Configure your visualization options and click 'Create Visualization'")
+                
+                # Show sample visualization placeholder
+                st.write("### Sample Visualization Preview")
+                sample_df = pd.DataFrame({
+                    'category': ['A', 'B', 'C', 'D'],
+                    'value': [10, 20, 15, 25]
+                })
+                st.bar_chart(sample_df, x='category', y='value')
+    
+    # Tab 4: Performance Metrics
+    with tabs[3]:
+        st.header("Model Performance Metrics")
+        st.write("Evaluate machine learning model performance on your data")
+        
+        # Select model type
+        model_type = st.selectbox(
+            "Model Type",
+            ["Classification", "Regression"],
+            key="model_type"
+        )
+        
+        # Get column lists by type
+        numeric_cols = st.session_state.df.select_dtypes(include=['number']).columns.tolist()
+        categorical_cols = st.session_state.df.select_dtypes(include=['object', 'category']).columns.tolist()
+        all_cols = st.session_state.df.columns.tolist()
+        
+        # Select target column
+        if model_type == "Classification":
+            # For classification, the target could be numeric or categorical
+            target_col = st.selectbox(
+                "Target Column (to predict)",
+                all_cols,
+                key="classification_target"
+            )
+        else:
+            # For regression, the target should be numeric
+            if numeric_cols:
+                target_col = st.selectbox(
+                    "Target Column (to predict)",
+                    numeric_cols,
+                    key="regression_target"
+                )
+            else:
+                st.warning("No numeric columns found for regression target.")
+                target_col = None
+        
+        # Select feature columns
+        if target_col:
+            # Remove target column from possible features
+            available_features = [col for col in all_cols if col != target_col]
+            
+            feature_cols = st.multiselect(
+                "Feature Columns (predictors)",
+                available_features,
+                default=available_features[:min(5, len(available_features))],
+                key="feature_columns"
+            )
+            
+            # Test size slider
+            test_size = st.slider(
+                "Test Set Size",
+                min_value=0.1,
+                max_value=0.5,
+                value=0.2,
+                step=0.05,
+                key="test_size"
+            )
+            
+            # Button to run evaluation
+            if st.button("Evaluate Model Performance", key="evaluate_model"):
+                if feature_cols and target_col:
+                    with st.spinner("Training and evaluating models..."):
+                        try:
+                            # Call the evaluation function
+                            performance_data = du.evaluate_model_performance(
+                                df=st.session_state.df,
+                                target_col=target_col,
+                                feature_cols=feature_cols,
+                                model_type=model_type.lower(),
+                                test_size=test_size
+                            )
+                            
+                            if performance_data['success']:
+                                # Save the performance data in session state for later access
+                                st.session_state.performance_data = performance_data
+                                
+                                # Create tabs for different performance visualizations
+                                metric_tabs = st.tabs([
+                                    "Model Comparison", 
+                                    "Feature Importance", 
+                                    "Detailed Metrics"
+                                ])
+                                
+                                # Tab 1: Model Comparison
+                                with metric_tabs[0]:
+                                    # For classification
+                                    if model_type.lower() == 'classification':
+                                        # Display classification metrics comparison
+                                        st.subheader("Classification Metrics Comparison")
+                                        
+                                        # Create a DataFrame for comparison
+                                        metrics_df = pd.DataFrame({
+                                            'Metric': ['Accuracy', 'Precision', 'Recall', 'F1 Score'],
+                                            'Logistic Regression': [
+                                                performance_data['logistic_regression']['accuracy'],
+                                                performance_data['logistic_regression']['precision'],
+                                                performance_data['logistic_regression']['recall'],
+                                                performance_data['logistic_regression']['f1']
+                                            ],
+                                            'Random Forest': [
+                                                performance_data['random_forest']['accuracy'],
+                                                performance_data['random_forest']['precision'],
+                                                performance_data['random_forest']['recall'],
+                                                performance_data['random_forest']['f1']
+                                            ]
+                                        })
+                                        
+                                        # Display metrics as a table
+                                        st.dataframe(metrics_df, use_container_width=True)
+                                        
+                                        # Display charts for each metric
+                                        st.subheader("Metrics Visualization")
+                                        
+                                        # Reshape data for charting
+                                        chart_data = pd.DataFrame({
+                                            'Logistic Regression': metrics_df['Logistic Regression'],
+                                            'Random Forest': metrics_df['Random Forest'],
+                                        }, index=metrics_df['Metric'])
+                                        
+                                        # Display as bar chart
+                                        st.bar_chart(chart_data)
+                                        
+                                        # For confusion matrix, show as a table
+                                        st.subheader("Confusion Matrix (Random Forest)")
+                                        
+                                        # Get confusion matrix
+                                        cm = np.array(performance_data['confusion_matrix']['random_forest'])
+                                        
+                                        # Create a DataFrame
+                                        cm_df = pd.DataFrame(cm)
+                                        
+                                        # Get class labels
+                                        labels = list(performance_data.get('label_mapping', {}).keys())
+                                        if labels:
+                                            cm_df.index = labels
+                                            cm_df.columns = labels
+                                        
+                                        # Display as styled dataframe
+                                        st.dataframe(cm_df.style.background_gradient(cmap='Blues'), use_container_width=True)
+                                    
+                                    # For regression
+                                    else:
+                                        # Display regression metrics comparison
+                                        st.subheader("Regression Metrics Comparison")
+                                        
+                                        # Create a DataFrame for comparison
+                                        metrics_df = pd.DataFrame({
+                                            'Metric': ['MSE', 'RMSE', 'MAE', 'R²'],
+                                            'Linear Regression': [
+                                                performance_data['linear_regression']['mse'],
+                                                performance_data['linear_regression']['rmse'],
+                                                performance_data['linear_regression']['mae'],
+                                                performance_data['linear_regression']['r2']
+                                            ],
+                                            'Random Forest': [
+                                                performance_data['random_forest']['mse'],
+                                                performance_data['random_forest']['rmse'],
+                                                performance_data['random_forest']['mae'],
+                                                performance_data['random_forest']['r2']
+                                            ]
+                                        })
+                                        
+                                        # Display metrics as a table
+                                        st.dataframe(metrics_df, use_container_width=True)
+                                        
+                                        # Display R² comparison
+                                        st.subheader("R² Score Comparison")
+                                        r2_data = pd.DataFrame({
+                                            'Model': ['Linear Regression', 'Random Forest'],
+                                            'R²': [
+                                                performance_data['linear_regression']['r2'],
+                                                performance_data['random_forest']['r2']
+                                            ]
+                                        })
+                                        st.bar_chart(r2_data, x='Model', y='R²')
+                                
+                                # Tab 2: Feature Importance
+                                with metric_tabs[1]:
+                                    st.subheader("Feature Importance")
+                                    
+                                    # Get feature importance data
+                                    feature_data = pd.DataFrame(performance_data['feature_importance'])
+                                    feature_data = feature_data.sort_values('importance', ascending=False)
+                                    
+                                    # Round importance values for display
+                                    feature_data['importance'] = feature_data['importance'].round(4)
+                                    
+                                    # Display as table
+                                    st.dataframe(feature_data, use_container_width=True)
+                                    
+                                    # Show as bar chart
+                                    st.bar_chart(feature_data, x='feature', y='importance')
+                                
+                                # Tab 3: Detailed Metrics
+                                with metric_tabs[2]:
+                                    if model_type.lower() == 'classification':
+                                        # Display classification metrics
+                                        st.subheader("Classification Metrics")
+                                        
+                                        # Create a DataFrame for comparison
+                                        metrics_df = pd.DataFrame({
+                                            'Metric': ['Accuracy', 'Precision', 'Recall', 'F1 Score'],
+                                            'Logistic Regression': [
+                                                performance_data['logistic_regression']['accuracy'],
+                                                performance_data['logistic_regression']['precision'],
+                                                performance_data['logistic_regression']['recall'],
+                                                performance_data['logistic_regression']['f1']
+                                            ],
+                                            'Random Forest': [
+                                                performance_data['random_forest']['accuracy'],
+                                                performance_data['random_forest']['precision'],
+                                                performance_data['random_forest']['recall'],
+                                                performance_data['random_forest']['f1']
+                                            ]
+                                        })
+                                        
+                                        # Show the metrics
+                                        st.dataframe(metrics_df, use_container_width=True)
+                                        
+                                    else:  # Regression
+                                        # Display regression metrics
+                                        st.subheader("Regression Metrics")
+                                        
+                                        # Create a DataFrame for comparison
+                                        metrics_df = pd.DataFrame({
+                                            'Metric': ['MSE', 'RMSE', 'MAE', 'R²'],
+                                            'Linear Regression': [
+                                                performance_data['linear_regression']['mse'],
+                                                performance_data['linear_regression']['rmse'],
+                                                performance_data['linear_regression']['mae'],
+                                                performance_data['linear_regression']['r2']
+                                            ],
+                                            'Random Forest': [
+                                                performance_data['random_forest']['mse'],
+                                                performance_data['random_forest']['rmse'],
+                                                performance_data['random_forest']['mae'],
+                                                performance_data['random_forest']['r2']
+                                            ]
+                                        })
+                                        
+                                        # Format the numbers
+                                        for col in ['Linear Regression', 'Random Forest']:
+                                            metrics_df[col] = metrics_df[col].round(4)
+                                        
+                                        # Show the metrics
+                                        st.dataframe(metrics_df, use_container_width=True)
+                                        
+                                        # Show predictions table
+                                        if 'predictions' in performance_data:
+                                            st.subheader("Prediction vs Actual (Sample)")
+                                            pred_df = pd.DataFrame(performance_data['predictions'][:20])
+                                            pred_df = pred_df.round(2)
+                                            st.dataframe(pred_df, use_container_width=True)
+                                
+                                # Save results option
+                                if st.session_state.dataset_id:
+                                    st.subheader("Save Results")
+                                    if st.button("Save Performance Metrics", key="save_metrics"):
+                                        try:
+                                            # Save to database
+                                            result_id = db.save_analysis_result(
+                                                dataset_id=st.session_state.dataset_id,
+                                                analysis_type="model_performance",
+                                                result_data=json.dumps(performance_data, default=str)
+                                            )
+                                            st.success(f"Performance metrics saved with ID: {result_id}")
+                                        except Exception as e:
+                                            st.error(f"Error saving performance metrics: {str(e)}")
+                                            st.code(str(e))
+                            else:
+                                # Show error message
+                                st.error(f"Error evaluating model performance: {performance_data['error']}")
+                                
+                        except Exception as e:
+                            st.error(f"Error during model evaluation: {str(e)}")
+                            st.code(str(e))
+                else:
+                    st.warning("Please select target column and at least one feature column.")
+        else:
+            st.info("Please select a target column to predict.")
+    
+    # Tab 5: Chat with Data
+    with tabs[4]:
+        st.header("Chat with Your Data")
+        st.write("Ask questions about your data in natural language using Gemini AI.")
+        
+        # Check if Gemini API is configured correctly
+        if not gemini_configured:
+            st.error(f"Gemini API is not configured correctly. Error: {gemini_error}")
+            st.info("Please update the GEMINI_API_KEY in app.py with your actual API key.")
+            st.stop()  # Stop execution of this tab if Gemini is not configured
+        
+        # Display chat history
+        for message in st.session_state.chat_history:
+            if message["role"] == "user":
+                st.markdown(f"**You:** {message['content']}")
+            else:
+                st.markdown(f"**AI:** {message['content']}")
+                
+                # If the message has a figure, display it
+                if "figure" in message:
+                    try:
+                        st.plotly_chart(message["figure"])
+                    except Exception as e:
+                        st.error(f"Error displaying visualization: {str(e)}")
+        
+        # User input for new questions
+        user_question = st.text_input("Ask a question about your data:")
+        
+        # Button to submit question
+        if st.button("Ask", key="ask_button"):
+            if user_question:
+                # Add user question to chat history
+                st.session_state.chat_history.append({"role": "user", "content": user_question})
+                
+                # Use a spinner while getting the response
+                with st.spinner("Thinking..."):
+                    try:
+                        # Get response from Gemini
+                        response = gemini.analyze_data_with_gemini(st.session_state.df, user_question)
+                        
+                        # Process the response based on type
+                        if response["response_type"] == "visualization":
+                            # Response includes visualization details but the visualization is already displayed
+                            ai_message = {
+                                "role": "assistant",
+                                "content": response["content"]
+                            }
+                            st.session_state.chat_history.append(ai_message)
+                            
+                            # Display the response
+                            st.markdown(f"**AI:** {response['content']}")
+                            
+                        elif response["response_type"] == "error":
+                            # Error in processing
+                            ai_message = {
+                                "role": "assistant",
+                                "content": f"Sorry, I encountered an error: {response['content']}"
+                            }
+                            st.session_state.chat_history.append(ai_message)
+                            st.error(response["content"])
+                        
+                        else:
+                            # Text response
+                            ai_message = {
+                                "role": "assistant",
+                                "content": response["content"]
+                            }
+                            st.session_state.chat_history.append(ai_message)
+                            st.markdown(f"**AI:** {response['content']}")
+                    
+                    except Exception as e:
+                        # Handle any unexpected errors
+                        error_message = f"Sorry, an error occurred: {str(e)}"
+                        st.session_state.chat_history.append({"role": "assistant", "content": error_message})
+                        st.error(error_message)
+                        st.write("Detailed error information for debugging:")
+                        st.code(str(e))
+                
+                # Force a rerun to update the UI with the new chat
+                st.rerun()
+                
+        # Clear chat history button
+        if st.session_state.chat_history and st.button("Clear Chat History", key="clear_chat_button"):
+            st.session_state.chat_history = []
+            st.rerun()
+        
+        # Example questions
+        st.subheader("Example Questions:")
+        example_questions = [
+            "What's the average sales by region?",
+            "Show me the relationship between price and quantity",
+            "Create a bar chart of total sales by product",
+            "Which product has the highest average rating?",
+            "What's the distribution of customer ages?"
+        ]
+        
+        # Display example questions as buttons with unique keys
+        cols = st.columns(len(example_questions))
+        for i, (col, question) in enumerate(zip(cols, example_questions)):
+            with col:
+                if st.button(question, key=f"example_question_{i}"):
+                    # Set the question and trigger a rerun to simulate clicking the Ask button
+                    st.session_state.chat_history.append({"role": "user", "content": question})
+                    
+                    with st.spinner(f"Analyzing: {question}"):
+                        try:
+                            response = gemini.analyze_data_with_gemini(st.session_state.df, question)
+                            
+                            if response["response_type"] == "visualization":
+                                try:
+                                    ai_message = {
+                                        "role": "assistant",
+                                        "content": response["content"],
+                                        "figure": response["figure"]
+                                    }
+                                    st.session_state.chat_history.append(ai_message)
+                                except Exception as viz_error:
+                                    st.error(f"Error with visualization: {str(viz_error)}")
+                                    ai_message = {
+                                        "role": "assistant",
+                                        "content": f"Error creating visualization: {str(viz_error)}"
+                                    }
+                                    st.session_state.chat_history.append(ai_message)
+                            elif response["response_type"] == "error":
+                                ai_message = {
+                                    "role": "assistant",
+                                    "content": f"Sorry, I encountered an error: {response['content']}"
+                                }
+                                st.session_state.chat_history.append(ai_message)
+                            else:
+                                ai_message = {
+                                    "role": "assistant",
+                                    "content": response["content"]
+                                }
+                                st.session_state.chat_history.append(ai_message)
+                        except Exception as e:
+                            error_message = f"Sorry, an error occurred: {str(e)}"
+                            st.session_state.chat_history.append({"role": "assistant", "content": error_message})
+                    
+                    st.rerun()
+    
+    # Tab 6: Saved Items
+    with tabs[5]:
+        st.header("Saved Items")
+        st.write("View and manage saved datasets, analyses, and visualizations.")
+        
+        # Create subtabs for different item types
+        saved_tabs = st.tabs(["Datasets", "Analyses", "Visualizations"])
+        
+        # Saved Datasets
+        with saved_tabs[0]:
+            st.subheader("Saved Datasets")
+            
+            # Get datasets from database
+            try:
+                datasets = db.get_datasets()
+                if not datasets.empty:
+                    for _, dataset in datasets.iterrows():
+                        with st.expander(f"{dataset['name']} (ID: {dataset['id']})"):
+                            st.write(f"**Description:** {dataset['description'] or 'No description'}")
+                            st.write(f"**Rows:** {dataset['row_count']}")
+                            st.write(f"**Created:** {dataset['created_at']}")
+                            
+                            # Load button
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                if st.button(f"Load Dataset", key=f"load_{dataset['id']}"):
+                                    # Load dataset from file path or recreate
+                                    try:
+                                        if os.path.exists(dataset['file_path']):
+                                            if dataset['file_path'].endswith('.csv'):
+                                                st.session_state.df = pd.read_csv(dataset['file_path'])
+                                            elif dataset['file_path'].endswith('.xlsx'):
+                                                st.session_state.df = pd.read_excel(dataset['file_path'])
+                                        else:
+                                            st.warning("Original file not found. Using sample data.")
+                                            st.session_state.df = du.create_sample_data()
+                                        
+                                        st.session_state.dataset_id = dataset['id']
+                                        st.session_state.file_info = {
+                                            'filename': dataset['name'],
+                                            'size': dataset['file_size'],
+                                            'shape': (dataset['row_count'], len(json.loads(dataset['column_info'])['columns']))
+                                        }
+                                        st.success(f"Loaded dataset: {dataset['name']}")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error loading dataset: {str(e)}")
+                            
+                            with col2:
+                                # Delete button
+                                if st.button(f"Delete Dataset", key=f"delete_{dataset['id']}"):
+                                    confirm = st.checkbox(f"Confirm deletion of {dataset['name']}", key=f"confirm_{dataset['id']}")
+                                    
+                                    if confirm:
+                                        try:
+                                            # Delete file if it exists
+                                            if os.path.exists(dataset['file_path']):
+                                                try:
+                                                    os.remove(dataset['file_path'])
+                                                except:
+                                                    st.warning("Could not delete the file, but database entry will be removed.")
+                                            
+                                            # Delete from database
+                                            db.delete_dataset(dataset['id'])
+                                            st.success(f"Dataset {dataset['name']} deleted.")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error deleting dataset: {str(e)}")
+                else:
+                    st.info("No saved datasets found.")
+            except Exception as e:
+                st.error(f"Error loading datasets: {str(e)}")
+                st.code(str(e))
+        
+        # Saved Analyses
+        with saved_tabs[1]:
+            st.subheader("Saved Analyses")
+            
+            # Get analyses from database
+            try:
+                analyses = db.get_analysis_results()
+                if not analyses.empty:
+                    for _, analysis in analyses.iterrows():
+                        with st.expander(f"{analysis['analysis_type']} (ID: {analysis['id']})"):
+                            st.write(f"**Dataset ID:** {analysis['dataset_id']}")
+                            st.write(f"**Created:** {analysis['created_at']}")
+                            
+                            # Display the analysis data
+                            try:
+                                result_data = json.loads(analysis['result_data'])
+                                if isinstance(result_data, dict):
+                                    # Convert to DataFrame for better display
+                                    result_df = pd.DataFrame(result_data)
+                                    st.dataframe(result_df, use_container_width=True)
+                                else:
+                                    st.json(result_data)
+                            except Exception as e:
+                                st.error(f"Could not parse result data: {str(e)}")
+                            
+                            # Delete button
+                            if st.button(f"Delete Analysis", key=f"delete_analysis_{analysis['id']}"):
+                                confirm = st.checkbox(f"Confirm deletion", key=f"confirm_analysis_{analysis['id']}")
+                                
+                                if confirm:
+                                    try:
+                                        # Delete from database
+                                        db.delete_analysis_result(analysis['id'])
+                                        st.success(f"Analysis deleted.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error deleting analysis: {str(e)}")
+                else:
+                    st.info("No saved analyses found.")
+            except Exception as e:
+                st.error(f"Error loading analyses: {str(e)}")
+                st.code(str(e))
+        
+        # Saved Visualizations
+        with saved_tabs[2]:
+            st.subheader("Saved Visualizations")
+            
+            # Get visualizations from database
+            try:
+                visualizations = db.get_visualizations()
+                if not visualizations.empty:
+                    for _, viz in visualizations.iterrows():
+                        with st.expander(f"{viz['title']} (ID: {viz['id']})"):
+                            st.write(f"**Dataset ID:** {viz['dataset_id']}")
+                            st.write(f"**Chart Type:** {viz['chart_type']}")
+                            st.write(f"**Created:** {viz['created_at']}")
+                            
+                            # Try to recreate the visualization
+                            try:
+                                # Parse the config
+                                config = json.loads(viz['config'])
+                                
+                                # Create figure from config
+                                try:
+                                    fig = go.Figure(data=config.get('data', []), layout=config.get('layout', {}))
+                                except Exception as fig_error:
+                                    # Fallback approach for older or malformed configs
+                                    st.warning(f"Using fallback visualization method: {str(fig_error)}")
+                                    data_traces = []
+                                    
+                                    if 'data' in config:
+                                        for trace in config['data']:
+                                            trace_type = trace.get('type', 'scatter')
+                                            
+                                            if trace_type == 'bar':
+                                                data_traces.append(go.Bar(
+                                                    x=trace.get('x', []),
+                                                    y=trace.get('y', []),
+                                                    name=trace.get('name', ''),
+                                                    marker=trace.get('marker', {})
+                                                ))
+                                            elif trace_type == 'scatter':
+                                                data_traces.append(go.Scatter(
+                                                    x=trace.get('x', []),
+                                                    y=trace.get('y', []),
+                                                    mode=trace.get('mode', 'markers'),
+                                                    name=trace.get('name', ''),
+                                                    marker=trace.get('marker', {})
+                                                ))
+                                            elif trace_type == 'pie':
+                                                data_traces.append(go.Pie(
+                                                    labels=trace.get('labels', []),
+                                                    values=trace.get('values', []),
+                                                    name=trace.get('name', '')
+                                                ))
+                                            else:
+                                                st.warning(f"Unsupported trace type: {trace_type}")
+                                        
+                                        # Create figure with parsed traces
+                                        fig = go.Figure(data=data_traces)
+                                        
+                                        # Add layout if available
+                                        if 'layout' in config:
+                                            fig.update_layout(**config['layout'])
+                                    else:
+                                        st.error("Invalid visualization config: No data found")
+                                        fig = go.Figure()
+                                
+                                # Update layout with title
+                                fig.update_layout(title=viz['title'], title_x=0.5)
+                                
+                                # Display the figure
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Export options
+                                export_format = st.selectbox("Export As", ["HTML", "JSON"], key=f"export_{viz['id']}")
+                                
+                                if export_format == "HTML":
+                                    try:
+                                        buffer = io.StringIO()
+                                        fig.write_html(buffer)
+                                        html_bytes = buffer.getvalue().encode()
+                                        st.download_button(
+                                            label=f"Download HTML",
+                                            data=html_bytes,
+                                            file_name=f"{viz['title'].replace(' ', '_')}.html",
+                                            mime="text/html",
+                                            key=f"download_html_{viz['id']}"
+                                        )
+                                    except Exception as e:
+                                        st.error(f"Error creating HTML download: {str(e)}")
+                                elif export_format == "JSON":
+                                    try:
+                                        # Create a clean JSON representation of the figure
+                                        fig_json = json.dumps(fig.to_dict())
+                                        st.download_button(
+                                            label=f"Download JSON",
+                                            data=fig_json,
+                                            file_name=f"{viz['title'].replace(' ', '_')}.json",
+                                            mime="application/json",
+                                            key=f"download_json_{viz['id']}"
+                                        )
+                                    except Exception as e:
+                                        st.error(f"Error creating JSON download: {str(e)}")
+                            except Exception as e:
+                                st.error(f"Error recreating visualization: {str(e)}")
+                            
+                            # Delete button
+                            if st.button(f"Delete Visualization", key=f"delete_viz_{viz['id']}"):
+                                confirm = st.checkbox(f"Confirm deletion", key=f"confirm_viz_{viz['id']}")
+                                
+                                if confirm:
+                                    try:
+                                        # Delete from database
+                                        db.delete_visualization(viz['id'])
+                                        st.success(f"Visualization deleted.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error deleting visualization: {str(e)}")
+                else:
+                    st.info("No saved visualizations found.")
+            except Exception as e:
+                st.error(f"Error loading visualizations: {str(e)}")
+                st.code(str(e))
+else:
+    # Show message when no data is loaded
+    st.info("👈 Please upload a dataset using the sidebar to get started or load the sample data.")
+    
+    # Show sample features
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.header("Features")
+        st.markdown("""
+        - 📊 **Comprehensive Data Analysis**: Descriptive statistics, correlation analysis, and more
+        - 📈 **Interactive Visualizations**: Create and customize various charts and graphs
+        - 💬 **AI-Powered Chat**: Ask questions about your data in natural language using Gemini AI
+        - 💾 **Data Management**: Save datasets, analyses, and visualizations for future reference
+        - 📤 **Export and Share**: Export results in multiple formats
+        """)
+    
+    with col2:
+        st.header("How to Get Started")
+        st.markdown("""
+        1. Upload your CSV or Excel file using the sidebar
+        2. Enter your Gemini API key to use the chat functionality
+        3. Explore your data through the different tabs
+        4. Save your results to the database for future reference
+        
+        Don't have data? Click "Load Sample Data" to try the platform with our sample dataset.
+        """)
